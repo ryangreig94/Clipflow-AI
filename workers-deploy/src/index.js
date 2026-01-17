@@ -1293,27 +1293,30 @@ async function processAiShortJob(job) {
           throw new Error('Invalid job payload: keywords must be valid JSON');
         }
 
-        const { topic, style, duration, script, voiceId } = config;
+        const { topic, style, duration, script, voice, scenes, hashtags } = config;
         
-        if (!script || !script.fullScript) {
+        // script is sent as a plain string from the frontend
+        const fullScript = typeof script === 'string' ? script : (script?.fullScript || null);
+        
+        if (!fullScript) {
           isValidationError = true;
           throw new Error('Missing script in job payload');
         }
 
         const targetDuration = parseInt(duration) || 60;
-        const scenes = script.scenes || [];
+        const scenesList = scenes || [];
         
-        console.log(`[${workerId}] AI Short: "${topic}" (${style}), ${targetDuration}s, ${scenes.length} scenes`);
+        console.log(`[${workerId}] AI Short: "${topic}" (${style}), ${targetDuration}s, ${scenesList.length} scenes`);
 
         const audioPath = path.join(jobDir, 'voiceover.mp3');
-        const voiceoverBuffer = await generateVoiceover(script.fullScript, voiceId || 'Rachel');
+        const voiceoverBuffer = await generateVoiceover(fullScript, voice || 'Rachel');
         fs.writeFileSync(audioPath, voiceoverBuffer);
         console.log(`[${workerId}] Voiceover saved: ${audioPath}`);
 
         let videoClips = [];
         
-        if (scenes.length > 0) {
-          const pexelsVideos = await downloadPexelsVideos(scenes, targetDuration);
+        if (scenesList.length > 0) {
+          const pexelsVideos = await downloadPexelsVideos(scenesList, targetDuration);
           
           for (let i = 0; i < pexelsVideos.length; i++) {
             const video = pexelsVideos[i];
@@ -1336,7 +1339,8 @@ async function processAiShortJob(job) {
         if (videoClips.length === 0) {
           console.log(`[${workerId}] No video clips, creating background with hook text...`);
           
-          const hookText = sanitizeForFFmpeg(script.hook || topic || 'AI Generated Video', 100);
+          // Use first 100 chars of script as hook text for background video
+          const hookText = sanitizeForFFmpeg(topic || fullScript.slice(0, 100) || 'AI Generated Video', 100);
           const fontPath = '/app/fonts/DejaVuSans.ttf';
           
           if (fs.existsSync(fontPath)) {
