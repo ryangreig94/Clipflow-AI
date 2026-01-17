@@ -1353,7 +1353,7 @@ async function processAiShortJob(job) {
           throw new Error('Invalid job payload: keywords must be valid JSON');
         }
 
-        const { topic, style, duration, script, voice, scenes, hashtags } = config;
+        const { topic, style, duration, script, voice, scenes, hashtags, outputMode, clipCount } = config;
         
         // script is sent as a plain string from the frontend
         const fullScript = typeof script === 'string' ? script : (script?.fullScript || null);
@@ -1365,103 +1365,187 @@ async function processAiShortJob(job) {
 
         const targetDuration = parseInt(duration) || 60;
         const scenesList = scenes || [];
+        const isMultiClip = outputMode === 'multi' && (clipCount || 1) > 1;
+        const numClips = isMultiClip ? Math.min(parseInt(clipCount) || 3, 5) : 1;
         
-        console.log(`[${workerId}] AI Short: "${topic}" (${style}), ${targetDuration}s, ${scenesList.length} scenes`);
+        console.log(`[${workerId}] AI Short: "${topic}" (${style}), ${targetDuration}s, ${scenesList.length} scenes, mode: ${isMultiClip ? `multi (${numClips} clips)` : 'single'}`);
 
         const audioPath = path.join(jobDir, 'voiceover.mp3');
         const voiceoverBuffer = await generateVoiceover(fullScript, voice || 'Rachel');
         fs.writeFileSync(audioPath, voiceoverBuffer);
         console.log(`[${workerId}] Voiceover saved: ${audioPath}`);
 
-        const outputPath = path.join(jobDir, 'output.mp4');
+        // Get actual audio duration using ffprobe
+        let audioDuration = targetDuration;
+        try {
+          const { stdout: probeOutput } = await execAsync(
+            `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${audioPath}"`,
+            { timeout: 10000 }
+          );
+          audioDuration = parseFloat(probeOutput.trim()) || targetDuration;
+          console.log(`[${workerId}] Actual audio duration: ${audioDuration.toFixed(1)}s`);
+        } catch (probeErr) {
+          console.log(`[${workerId}] Could not probe audio duration, using target: ${targetDuration}s`);
+        }
 
+        // Download images for scenes
+        let images = [];
         if (scenesList.length > 0) {
           console.log(`[${workerId}] Downloading images for ${scenesList.length} scenes...`);
-          const images = await downloadPexelsImages(scenesList, jobDir);
+          images = await downloadPexelsImages(scenesList, jobDir);
+        }
+
+        const uploadedUrls = [];
+
+        if (isMultiClip && scenesList.length >= numClips) {
+          // Multi-clip mode: split scenes into segments
+          const scenesPerClip = Math.ceil(scenesList.length / numClips);
+          const clipDuration = audioDuration / numClips;
+          
+          console.log(`[${workerId}] Creating ${numClips} clips, ${scenesPerClip} scenes each, ~${clipDuration.toFixed(1)}s per clip`);
+
+          for (let clipIdx = 0; clipIdx < numClips; clipIdx++) {
+            const clipOutputPath = path.join(jobDir, `clip_${clipIdx + 1}.mp4`);
+            const startScene = clipIdx * scenesPerClip;
+            const endScene = Math.min(startScene + scenesPerClip, scenesList.length);
+            const clipScenes = scenesList.slice(startScene, endScene);
+            const clipImages = images.filter(img => img.sceneIndex >= startScene && img.sceneIndex < endScene);
+            
+            // Adjust image scene indices to be relative to this clip
+            const adjustedImages = clipImages.map(img => ({
+              ...img,
+              sceneIndex: img.sceneIndex - startScene
+            }));
+            
+            // Extract audio segment for this clip
+            const clipAudioPath = path.join(jobDir, `audio_clip_${clipIdx + 1}.mp3`);
+            const audioStart = clipIdx * clipDuration;
+            await execAsync(
+              `ffmpeg -i "${audioPath}" -ss ${audioStart} -t ${clipDuration} -c:a copy -y "${clipAudioPath}"`,
+              { timeout: 30000 }
+            );
+            
+            if (adjustedImages.length > 0) {
+              await createImageSlideshow(adjustedImages, clipScenes, clipAudioPath, clipOutputPath, clipDuration, jobDir);
+            } else {
+              // Fallback for clips without images
+              const hookText = sanitizeForFFmpeg(`${topic} - Part ${clipIdx + 1}`, 60);
+              const fontPath = '/app/fonts/DejaVuSans.ttf';
+              
+              if (fs.existsSync(fontPath)) {
+                await execAsync(
+                  `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${clipDuration} ` +
+                  `-i "${clipAudioPath}" ` +
+                  `-vf "drawtext=text='${hookText}':fontfile=${fontPath}:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
+                  `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${clipOutputPath}"`,
+                  { timeout: 180000 }
+                );
+              } else {
+                await execAsync(
+                  `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${clipDuration} ` +
+                  `-i "${clipAudioPath}" ` +
+                  `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${clipOutputPath}"`,
+                  { timeout: 180000 }
+                );
+              }
+            }
+
+            // Upload each clip
+            const clipStoragePath = `${currentJob.user_id}/${currentJob.id}_clip${clipIdx + 1}.mp4`;
+            const clipBuffer = fs.readFileSync(clipOutputPath);
+            
+            const { error: clipUploadError } = await supabase.storage
+              .from('renders')
+              .upload(clipStoragePath, clipBuffer, {
+                contentType: 'video/mp4',
+                upsert: true
+              });
+
+            if (!clipUploadError) {
+              const { data: clipUrlData } = supabase.storage
+                .from('renders')
+                .getPublicUrl(clipStoragePath);
+              if (clipUrlData?.publicUrl) {
+                uploadedUrls.push(clipUrlData.publicUrl);
+                console.log(`[${workerId}] Clip ${clipIdx + 1} uploaded: ${clipUrlData.publicUrl}`);
+              }
+            }
+          }
+        } else {
+          // Single video mode: use full audio duration for video
+          const outputPath = path.join(jobDir, 'output.mp4');
           
           if (images.length > 0) {
-            await createImageSlideshow(images, scenesList, audioPath, outputPath, targetDuration, jobDir);
+            await createImageSlideshow(images, scenesList, audioPath, outputPath, audioDuration, jobDir);
           } else {
-            console.log(`[${workerId}] No images downloaded, creating fallback with topic text...`);
+            console.log(`[${workerId}] No images available, creating fallback with topic text...`);
             const hookText = sanitizeForFFmpeg(topic || 'AI Generated Video', 60);
             const fontPath = '/app/fonts/DejaVuSans.ttf';
             
             if (fs.existsSync(fontPath)) {
               await execAsync(
-                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${targetDuration} ` +
+                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${audioDuration} ` +
                 `-i "${audioPath}" ` +
                 `-vf "drawtext=text='${hookText}':fontfile=${fontPath}:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
-                `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${outputPath}"`,
+                `-c:v libx264 -preset fast -crf 23 -c:a aac -y "${outputPath}"`,
                 { timeout: 180000 }
               );
             } else {
               await execAsync(
-                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${targetDuration} ` +
+                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${audioDuration} ` +
                 `-i "${audioPath}" ` +
-                `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${outputPath}"`,
+                `-c:v libx264 -preset fast -crf 23 -c:a aac -y "${outputPath}"`,
                 { timeout: 180000 }
               );
             }
           }
-        } else {
-          console.log(`[${workerId}] No scenes defined, creating simple voiceover video...`);
-          const hookText = sanitizeForFFmpeg(topic || 'AI Generated Video', 60);
-          const fontPath = '/app/fonts/DejaVuSans.ttf';
-          
-          if (fs.existsSync(fontPath)) {
-            await execAsync(
-              `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${targetDuration} ` +
-              `-i "${audioPath}" ` +
-              `-vf "drawtext=text='${hookText}':fontfile=${fontPath}:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
-              `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${outputPath}"`,
-              { timeout: 180000 }
-            );
-          } else {
-            await execAsync(
-              `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${targetDuration} ` +
-              `-i "${audioPath}" ` +
-              `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${outputPath}"`,
-              { timeout: 180000 }
-            );
+
+          // Upload single video
+          const storagePath = `${currentJob.user_id}/${currentJob.id}.mp4`;
+          const fileBuffer = fs.readFileSync(outputPath);
+
+          const { error: uploadError } = await supabase.storage
+            .from('renders')
+            .upload(storagePath, fileBuffer, {
+              contentType: 'video/mp4',
+              upsert: true
+            });
+
+          if (uploadError) {
+            throw new Error(`Upload failed: ${uploadError.message}`);
+          }
+
+          const { data: urlData } = supabase.storage
+            .from('renders')
+            .getPublicUrl(storagePath);
+
+          if (urlData?.publicUrl) {
+            uploadedUrls.push(urlData.publicUrl);
           }
         }
 
-        console.log(`[${workerId}] Video assembled, uploading to storage...`);
-
-        const storagePath = `${currentJob.user_id}/${currentJob.id}.mp4`;
-        const fileBuffer = fs.readFileSync(outputPath);
-
-        const { error: uploadError } = await supabase.storage
-          .from('renders')
-          .upload(storagePath, fileBuffer, {
-            contentType: 'video/mp4',
-            upsert: true
-          });
-
-        if (uploadError) {
-          throw new Error(`Upload failed: ${uploadError.message}`);
+        if (uploadedUrls.length === 0) {
+          throw new Error('Failed to upload any videos');
         }
 
-        const { data: urlData } = supabase.storage
-          .from('renders')
-          .getPublicUrl(storagePath);
-
-        const publicUrl = urlData?.publicUrl;
-
-        if (!publicUrl) {
-          throw new Error('Failed to get public URL');
-        }
+        // Store first URL as main result, store all URLs in result if multi-clip
+        const resultUrl = uploadedUrls[0];
+        const resultData = isMultiClip ? { clips: uploadedUrls } : null;
 
         await supabase
           .from('video_processing_jobs')
           .update({
             status: 'done',
             render_status: 'done',
-            result_url: publicUrl
+            result_url: resultUrl,
+            keywords: JSON.stringify({
+              ...config,
+              resultClips: isMultiClip ? uploadedUrls : undefined
+            })
           })
           .eq('id', currentJob.id);
 
-        console.log(`[${workerId}] AI short job ${currentJob.id} completed: ${publicUrl}`);
+        console.log(`[${workerId}] AI short job ${currentJob.id} completed: ${isMultiClip ? `${uploadedUrls.length} clips` : resultUrl}`);
         
         success = true;
         
