@@ -1163,24 +1163,23 @@ async function generateVoiceover(text, voiceId) {
   return audioBuffer;
 }
 
-async function downloadPexelsVideos(scenes, targetDuration) {
+async function downloadPexelsImages(scenes, jobDir) {
   if (!PEXELS_API_KEY) {
-    console.log(`[${workerId}] PEXELS_API_KEY not configured, using placeholder videos`);
+    console.log(`[${workerId}] PEXELS_API_KEY not configured, cannot fetch images`);
     return [];
   }
 
-  const videos = [];
-  const sceneDuration = Math.ceil(targetDuration / scenes.length);
+  const images = [];
 
-  for (let i = 0; i < scenes.length && i < 6; i++) {
+  for (let i = 0; i < scenes.length && i < 10; i++) {
     const scene = scenes[i];
-    const query = scene.visual || scene.text?.substring(0, 30) || 'abstract background';
+    const query = scene.visualDescription || scene.visual || scene.text?.substring(0, 50) || 'abstract dark background';
     
-    console.log(`[${workerId}] Searching Pexels for scene ${i + 1}: "${query}"`);
+    console.log(`[${workerId}] Searching Pexels images for scene ${i + 1}: "${query.substring(0, 40)}..."`);
 
     try {
       const response = await fetch(
-        `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&orientation=portrait&per_page=3&size=medium`,
+        `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&orientation=portrait&per_page=5&size=large`,
         {
           headers: {
             'Authorization': PEXELS_API_KEY
@@ -1189,49 +1188,110 @@ async function downloadPexelsVideos(scenes, targetDuration) {
       );
 
       if (!response.ok) {
-        console.log(`[${workerId}] Pexels search failed for scene ${i + 1}: ${response.status}`);
+        console.log(`[${workerId}] Pexels image search failed for scene ${i + 1}: ${response.status}`);
         continue;
       }
 
       const data = await response.json();
       
-      if (data.videos && data.videos.length > 0) {
-        const video = data.videos[0];
-        const hdFile = video.video_files?.find(f => f.quality === 'hd' && f.width < f.height) ||
-                       video.video_files?.find(f => f.quality === 'sd' && f.width < f.height) ||
-                       video.video_files?.[0];
+      if (data.photos && data.photos.length > 0) {
+        const photo = data.photos[Math.floor(Math.random() * Math.min(3, data.photos.length))];
+        const imageUrl = photo.src?.large2x || photo.src?.large || photo.src?.original;
         
-        if (hdFile?.link) {
-          videos.push({
-            url: hdFile.link,
-            duration: sceneDuration,
-            sceneIndex: i
-          });
-          console.log(`[${workerId}] Found video for scene ${i + 1}: ${hdFile.width}x${hdFile.height}`);
+        if (imageUrl) {
+          const imagePath = path.join(jobDir, `scene_${i}.jpg`);
+          
+          try {
+            const imgResponse = await fetch(imageUrl);
+            if (imgResponse.ok) {
+              const imgBuffer = Buffer.from(await imgResponse.arrayBuffer());
+              fs.writeFileSync(imagePath, imgBuffer);
+              
+              images.push({
+                path: imagePath,
+                sceneIndex: i,
+                text: scene.text || ''
+              });
+              console.log(`[${workerId}] Downloaded image for scene ${i + 1}: ${imgBuffer.length} bytes`);
+            }
+          } catch (dlErr) {
+            console.log(`[${workerId}] Failed to download image ${i + 1}: ${dlErr.message}`);
+          }
         }
+      } else {
+        console.log(`[${workerId}] No images found for scene ${i + 1}`);
       }
     } catch (err) {
       console.log(`[${workerId}] Pexels error for scene ${i + 1}: ${err.message}`);
     }
 
-    await new Promise(resolve => setTimeout(resolve, 200));
+    await new Promise(resolve => setTimeout(resolve, 150));
   }
 
-  return videos;
+  return images;
 }
 
-async function downloadVideoClip(url, outputPath) {
-  console.log(`[${workerId}] Downloading video clip...`);
-  
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to download video: ${response.status}`);
+async function createImageSlideshow(images, scenes, audioPath, outputPath, targetDuration, jobDir) {
+  if (images.length === 0) {
+    throw new Error('No images available for slideshow');
   }
+
+  const fontPath = '/app/fonts/DejaVuSans.ttf';
+  const hasFonts = fs.existsSync(fontPath);
+  const sceneDuration = targetDuration / scenes.length;
+
+  console.log(`[${workerId}] Creating slideshow with ${images.length} images, ${sceneDuration.toFixed(1)}s per scene`);
+
+  const processedClips = [];
   
-  const buffer = Buffer.from(await response.arrayBuffer());
-  fs.writeFileSync(outputPath, buffer);
-  console.log(`[${workerId}] Video clip downloaded: ${buffer.length} bytes`);
-  return buffer.length;
+  for (let i = 0; i < scenes.length; i++) {
+    const scene = scenes[i];
+    const image = images.find(img => img.sceneIndex === i) || images[images.length - 1];
+    const clipPath = path.join(jobDir, `clip_${i}.mp4`);
+    const sceneText = sanitizeForFFmpeg(scene.text || '', 80);
+    
+    let vfString = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1';
+    
+    if (hasFonts && sceneText) {
+      vfString += `,drawtext=text='${sceneText}':fontfile=${fontPath}:fontcolor=white:fontsize=42:x=(w-text_w)/2:y=h-200:box=1:boxcolor=black@0.6:boxborderw=20`;
+    }
+
+    try {
+      await execAsync(
+        `ffmpeg -loop 1 -i "${image.path}" -t ${sceneDuration} ` +
+        `-vf "${vfString}" ` +
+        `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -r 30 -an -y "${clipPath}"`,
+        { timeout: 60000 }
+      );
+      processedClips.push(clipPath);
+      console.log(`[${workerId}] Created clip ${i + 1}/${scenes.length}`);
+    } catch (err) {
+      console.log(`[${workerId}] Failed to create clip ${i}: ${err.message}`);
+    }
+  }
+
+  if (processedClips.length === 0) {
+    throw new Error('Failed to create any slideshow clips');
+  }
+
+  const concatListPath = path.join(jobDir, 'concat.txt');
+  const concatContent = processedClips.map(p => `file '${p}'`).join('\n');
+  fs.writeFileSync(concatListPath, concatContent);
+
+  const concatPath = path.join(jobDir, 'slideshow.mp4');
+  await execAsync(
+    `ffmpeg -f concat -safe 0 -i "${concatListPath}" ` +
+    `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -r 30 -y "${concatPath}"`,
+    { timeout: 180000 }
+  );
+
+  await execAsync(
+    `ffmpeg -i "${concatPath}" -i "${audioPath}" ` +
+    `-c:v libx264 -preset fast -crf 23 -c:a aac -map 0:v:0 -map 1:a:0 -shortest -y "${outputPath}"`,
+    { timeout: 180000 }
+  );
+
+  console.log(`[${workerId}] Slideshow created: ${outputPath}`);
 }
 
 async function claimAiShortJob() {
@@ -1313,34 +1373,39 @@ async function processAiShortJob(job) {
         fs.writeFileSync(audioPath, voiceoverBuffer);
         console.log(`[${workerId}] Voiceover saved: ${audioPath}`);
 
-        let videoClips = [];
-        
-        if (scenesList.length > 0) {
-          const pexelsVideos = await downloadPexelsVideos(scenesList, targetDuration);
-          
-          for (let i = 0; i < pexelsVideos.length; i++) {
-            const video = pexelsVideos[i];
-            const clipPath = path.join(jobDir, `clip_${i}.mp4`);
-            
-            try {
-              await downloadVideoClip(video.url, clipPath);
-              videoClips.push({
-                path: clipPath,
-                duration: video.duration
-              });
-            } catch (err) {
-              console.log(`[${workerId}] Failed to download clip ${i}: ${err.message}`);
-            }
-          }
-        }
-
         const outputPath = path.join(jobDir, 'output.mp4');
 
-        if (videoClips.length === 0) {
-          console.log(`[${workerId}] No video clips, creating background with hook text...`);
+        if (scenesList.length > 0) {
+          console.log(`[${workerId}] Downloading images for ${scenesList.length} scenes...`);
+          const images = await downloadPexelsImages(scenesList, jobDir);
           
-          // Use first 100 chars of script as hook text for background video
-          const hookText = sanitizeForFFmpeg(topic || fullScript.slice(0, 100) || 'AI Generated Video', 100);
+          if (images.length > 0) {
+            await createImageSlideshow(images, scenesList, audioPath, outputPath, targetDuration, jobDir);
+          } else {
+            console.log(`[${workerId}] No images downloaded, creating fallback with topic text...`);
+            const hookText = sanitizeForFFmpeg(topic || 'AI Generated Video', 60);
+            const fontPath = '/app/fonts/DejaVuSans.ttf';
+            
+            if (fs.existsSync(fontPath)) {
+              await execAsync(
+                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${targetDuration} ` +
+                `-i "${audioPath}" ` +
+                `-vf "drawtext=text='${hookText}':fontfile=${fontPath}:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
+                `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${outputPath}"`,
+                { timeout: 180000 }
+              );
+            } else {
+              await execAsync(
+                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${targetDuration} ` +
+                `-i "${audioPath}" ` +
+                `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${outputPath}"`,
+                { timeout: 180000 }
+              );
+            }
+          }
+        } else {
+          console.log(`[${workerId}] No scenes defined, creating simple voiceover video...`);
+          const hookText = sanitizeForFFmpeg(topic || 'AI Generated Video', 60);
           const fontPath = '/app/fonts/DejaVuSans.ttf';
           
           if (fs.existsSync(fontPath)) {
@@ -1359,49 +1424,6 @@ async function processAiShortJob(job) {
               { timeout: 180000 }
             );
           }
-        } else {
-          console.log(`[${workerId}] Assembling ${videoClips.length} video clips with voiceover...`);
-          
-          const concatListPath = path.join(jobDir, 'concat.txt');
-          const sceneDuration = Math.ceil(targetDuration / videoClips.length);
-          
-          const processedClips = [];
-          for (let i = 0; i < videoClips.length; i++) {
-            const clip = videoClips[i];
-            const processedPath = path.join(jobDir, `processed_${i}.mp4`);
-            
-            try {
-              await execAsync(
-                `ffmpeg -i "${clip.path}" -t ${sceneDuration} ` +
-                `-vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,fps=30" ` +
-                `-c:v libx264 -preset fast -crf 23 -an -y "${processedPath}"`,
-                { timeout: 60000 }
-              );
-              processedClips.push(processedPath);
-            } catch (err) {
-              console.log(`[${workerId}] Failed to process clip ${i}: ${err.message}`);
-            }
-          }
-          
-          if (processedClips.length === 0) {
-            throw new Error('Failed to process any video clips');
-          }
-
-          const concatContent = processedClips.map(p => `file '${p}'`).join('\n');
-          fs.writeFileSync(concatListPath, concatContent);
-
-          const concatPath = path.join(jobDir, 'concat.mp4');
-          await execAsync(
-            `ffmpeg -f concat -safe 0 -i "${concatListPath}" ` +
-            `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -r 30 -y "${concatPath}"`,
-            { timeout: 180000 }
-          );
-
-          await execAsync(
-            `ffmpeg -i "${concatPath}" -i "${audioPath}" ` +
-            `-c:v libx264 -preset fast -crf 23 -c:a aac -map 0:v:0 -map 1:a:0 -shortest -y "${outputPath}"`,
-            { timeout: 180000 }
-          );
         }
 
         console.log(`[${workerId}] Video assembled, uploading to storage...`);
