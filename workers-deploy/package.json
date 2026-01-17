@@ -1,0 +1,16 @@
+{
+  "name": "clipflow-workers",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "discover": "node src/discover.js",
+    "render": "node src/render.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
