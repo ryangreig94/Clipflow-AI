@@ -812,40 +812,60 @@ async function claimEditTaskFallback() {
 }
 
 // Wrap text into multiple lines for FFmpeg drawtext
-// Returns text with literal newline characters that FFmpeg can interpret
-function wrapTextForFFmpeg(text, maxCharsPerLine = 32) {
+// Returns text with actual newline characters
+function wrapTextForFFmpeg(text, maxCharsPerLine = 28) {
   if (!text) return '';
   const words = text.split(' ');
   const lines = [];
   let currentLine = '';
   
   for (const word of words) {
+    // If adding this word exceeds the limit, start a new line
     if ((currentLine + ' ' + word).trim().length <= maxCharsPerLine) {
       currentLine = (currentLine + ' ' + word).trim();
     } else {
       if (currentLine) lines.push(currentLine);
-      currentLine = word;
+      // If single word is too long, truncate it
+      currentLine = word.length > maxCharsPerLine ? word.substring(0, maxCharsPerLine - 3) + '...' : word;
     }
   }
   if (currentLine) lines.push(currentLine);
   
   // Return max 3 lines to avoid covering too much of the video
-  // Join with actual newline that will be escaped properly for FFmpeg
   return lines.slice(0, 3).join('\n');
 }
 
-// Escape text for FFmpeg drawtext, preserving newlines for multi-line support
+// Write text to a file and return the path for FFmpeg textfile option
+// This is the most reliable way to handle multi-line and special characters
+function writeTextFileForFFmpeg(text, jobDir, filename) {
+  const textPath = path.join(jobDir, filename);
+  // Remove any characters that could cause issues with FFmpeg textfile
+  const safeText = text
+    .replace(/%/g, '%%')          // Escape percent signs (FFmpeg expansion)
+    .replace(/\r/g, '');          // Remove carriage returns
+  fs.writeFileSync(textPath, safeText, 'utf8');
+  return textPath;
+}
+
+// Escape a file path for use in FFmpeg filter graph (colon and backslash are special)
+function escapePathForFFmpeg(filePath) {
+  return filePath
+    .replace(/\\/g, '/')          // Use forward slashes
+    .replace(/'/g, "'\\''")       // Escape single quotes for shell
+    .replace(/:/g, '\\:');        // Escape colons for FFmpeg
+}
+
+// Simple escape for FFmpeg drawtext inline text (single line only)
 function escapeForFFmpegDrawtext(text) {
   if (!text) return '';
-  // For FFmpeg drawtext, newlines need to be literal \n (two chars) not actual newline
-  // First escape special chars, then convert actual newlines to \n sequence
   return text
-    .replace(/\\/g, '\\\\')     // Escape backslashes first
-    .replace(/'/g, "\\'")        // Escape single quotes
-    .replace(/:/g, '\\:')        // Escape colons
+    .replace(/\\/g, '\\\\\\\\')  // Escape backslashes (need 4 for shell + FFmpeg)
+    .replace(/'/g, "'\\''")      // Escape single quotes for shell
+    .replace(/:/g, '\\:')        // Escape colons for FFmpeg
     .replace(/\[/g, '\\[')       // Escape brackets
     .replace(/\]/g, '\\]')
-    .replace(/\n/g, '\\n');      // Convert newlines to FFmpeg's \n sequence LAST
+    .replace(/\n/g, ' ')         // Replace newlines with spaces for single-line mode
+    .replace(/"/g, '\\"');       // Escape double quotes
 }
 
 // Sanitize text for FFmpeg drawtext filter
@@ -1285,17 +1305,22 @@ async function createImageSlideshow(images, scenes, audioPath, outputPath, targe
     const scene = scenes[i];
     const image = images.find(img => img.sceneIndex === i) || images[images.length - 1];
     const clipPath = path.join(jobDir, `clip_${i}.mp4`);
-    // Wrap text to fit on screen (max 32 chars per line, up to 3 lines)
-    const rawSceneText = (scene.text || '').substring(0, 120);
-    const wrappedText = wrapTextForFFmpeg(rawSceneText, 32);
-    const sceneText = escapeForFFmpegDrawtext(wrappedText);
+    
+    // Wrap text to fit on screen (max 28 chars per line, up to 3 lines)
+    const rawSceneText = (scene.text || '').substring(0, 100);
+    const wrappedText = wrapTextForFFmpeg(rawSceneText, 28);
     
     let vfString = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1';
     
-    if (hasFonts && sceneText) {
-      // Use smaller font (34) and position at bottom with text wrapping support
-      // y=h-th-100 positions box 100px from bottom, accounting for text height
-      vfString += `,drawtext=text='${sceneText}':fontfile=${fontPath}:fontcolor=white:fontsize=34:x=(w-text_w)/2:y=h-th-100:box=1:boxcolor=black@0.6:boxborderw=15`;
+    // Use textfile approach for reliable multi-line text rendering
+    if (hasFonts && wrappedText) {
+      const textFilePath = writeTextFileForFFmpeg(wrappedText, jobDir, `scene_${i}_text.txt`);
+      const escapedTextPath = escapePathForFFmpeg(textFilePath);
+      const escapedFontPath = escapePathForFFmpeg(fontPath);
+      // Use smaller font (32) and position at bottom
+      // expansion=none prevents FFmpeg from interpreting special sequences
+      // line_spacing=8 adds space between lines
+      vfString += `,drawtext=textfile='${escapedTextPath}':fontfile='${escapedFontPath}':fontcolor=white:fontsize=32:x=(w-text_w)/2:y=h-th-120:box=1:boxcolor=black@0.6:boxborderw=12:line_spacing=8:expansion=none`;
     }
 
     try {
