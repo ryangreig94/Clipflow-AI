@@ -811,6 +811,43 @@ async function claimEditTaskFallback() {
   return claimed;
 }
 
+// Wrap text into multiple lines for FFmpeg drawtext
+// Returns text with literal newline characters that FFmpeg can interpret
+function wrapTextForFFmpeg(text, maxCharsPerLine = 32) {
+  if (!text) return '';
+  const words = text.split(' ');
+  const lines = [];
+  let currentLine = '';
+  
+  for (const word of words) {
+    if ((currentLine + ' ' + word).trim().length <= maxCharsPerLine) {
+      currentLine = (currentLine + ' ' + word).trim();
+    } else {
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+    }
+  }
+  if (currentLine) lines.push(currentLine);
+  
+  // Return max 3 lines to avoid covering too much of the video
+  // Join with actual newline that will be escaped properly for FFmpeg
+  return lines.slice(0, 3).join('\n');
+}
+
+// Escape text for FFmpeg drawtext, preserving newlines for multi-line support
+function escapeForFFmpegDrawtext(text) {
+  if (!text) return '';
+  // For FFmpeg drawtext, newlines need to be literal \n (two chars) not actual newline
+  // First escape special chars, then convert actual newlines to \n sequence
+  return text
+    .replace(/\\/g, '\\\\')     // Escape backslashes first
+    .replace(/'/g, "\\'")        // Escape single quotes
+    .replace(/:/g, '\\:')        // Escape colons
+    .replace(/\[/g, '\\[')       // Escape brackets
+    .replace(/\]/g, '\\]')
+    .replace(/\n/g, '\\n');      // Convert newlines to FFmpeg's \n sequence LAST
+}
+
 // Sanitize text for FFmpeg drawtext filter
 function sanitizeForFFmpeg(text, maxLength = 50) {
   if (!text) return '';
@@ -1248,12 +1285,17 @@ async function createImageSlideshow(images, scenes, audioPath, outputPath, targe
     const scene = scenes[i];
     const image = images.find(img => img.sceneIndex === i) || images[images.length - 1];
     const clipPath = path.join(jobDir, `clip_${i}.mp4`);
-    const sceneText = sanitizeForFFmpeg(scene.text || '', 80);
+    // Wrap text to fit on screen (max 32 chars per line, up to 3 lines)
+    const rawSceneText = (scene.text || '').substring(0, 120);
+    const wrappedText = wrapTextForFFmpeg(rawSceneText, 32);
+    const sceneText = escapeForFFmpegDrawtext(wrappedText);
     
     let vfString = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1';
     
     if (hasFonts && sceneText) {
-      vfString += `,drawtext=text='${sceneText}':fontfile=${fontPath}:fontcolor=white:fontsize=42:x=(w-text_w)/2:y=h-200:box=1:boxcolor=black@0.6:boxborderw=20`;
+      // Use smaller font (34) and position at bottom with text wrapping support
+      // y=h-th-100 positions box 100px from bottom, accounting for text height
+      vfString += `,drawtext=text='${sceneText}':fontfile=${fontPath}:fontcolor=white:fontsize=34:x=(w-text_w)/2:y=h-th-100:box=1:boxcolor=black@0.6:boxborderw=15`;
     }
 
     try {
@@ -1397,10 +1439,11 @@ async function processAiShortJob(job) {
 
         const uploadedUrls = [];
 
-        if (isMultiClip && scenesList.length >= numClips) {
-          // Multi-clip mode: split scenes into segments
-          const scenesPerClip = Math.ceil(scenesList.length / numClips);
+        if (isMultiClip && scenesList.length > 0) {
+          // Multi-clip mode: split into segments based on time
+          // Allow fewer scenes than clips - we'll reuse images as needed
           const clipDuration = audioDuration / numClips;
+          const scenesPerClip = Math.max(1, Math.ceil(scenesList.length / numClips));
           
           console.log(`[${workerId}] Creating ${numClips} clips, ${scenesPerClip} scenes each, ~${clipDuration.toFixed(1)}s per clip`);
 
@@ -1408,14 +1451,29 @@ async function processAiShortJob(job) {
             const clipOutputPath = path.join(jobDir, `clip_${clipIdx + 1}.mp4`);
             const startScene = clipIdx * scenesPerClip;
             const endScene = Math.min(startScene + scenesPerClip, scenesList.length);
-            const clipScenes = scenesList.slice(startScene, endScene);
-            const clipImages = images.filter(img => img.sceneIndex >= startScene && img.sceneIndex < endScene);
             
-            // Adjust image scene indices to be relative to this clip
-            const adjustedImages = clipImages.map(img => ({
-              ...img,
-              sceneIndex: img.sceneIndex - startScene
-            }));
+            // If we run out of scenes, reuse the last ones
+            let clipScenes;
+            let adjustedImages;
+            if (startScene >= scenesList.length) {
+              // Reuse the last scene for this clip
+              clipScenes = [scenesList[scenesList.length - 1]];
+              adjustedImages = images.length > 0 ? [{ ...images[images.length - 1], sceneIndex: 0 }] : [];
+            } else {
+              clipScenes = scenesList.slice(startScene, Math.max(endScene, startScene + 1));
+              let clipImages = images.filter(img => img.sceneIndex >= startScene && img.sceneIndex < endScene);
+              
+              // If no images for this clip, use the last available image
+              if (clipImages.length === 0 && images.length > 0) {
+                clipImages = [{ ...images[images.length - 1] }];
+              }
+              
+              // Adjust image scene indices to be relative to this clip (0-indexed within clip)
+              adjustedImages = clipImages.map((img, idx) => ({
+                ...img,
+                sceneIndex: idx
+              }));
+            }
             
             // Extract audio segment for this clip
             const clipAudioPath = path.join(jobDir, `audio_clip_${clipIdx + 1}.mp3`);
