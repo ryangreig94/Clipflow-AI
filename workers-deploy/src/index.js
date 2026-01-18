@@ -218,42 +218,87 @@ async function getTwitchTopClips({ gameId = null, broadcasterId = null, limit = 
 async function discoverTwitchClips(keywords, maxClips = 5, recencyDays = 7) {
   console.log(`[${workerId}] Discovering Twitch clips for: ${keywords || 'top clips'} (last ${recencyDays} days)`);
   
-  let gameId = null;
-  let broadcasterId = null;
+  let clips = [];
+  let searchAttempts = [];
   
-  // If keywords provided, search for matching game/category first
   if (keywords) {
-    // Try to find a matching game
-    const games = await searchTwitchGames(keywords);
-    if (games.length > 0) {
-      gameId = games[0].id;
-      console.log(`[${workerId}] Found game: ${games[0].name} (ID: ${gameId})`);
-    } else {
-      // No game found, try to find a matching channel/broadcaster
-      console.log(`[${workerId}] No game found, searching for channel: ${keywords}`);
+    // Determine if keywords look like a channel/streamer name (has spaces, capital letters, or is short)
+    const looksLikeChannelName = keywords.includes(' ') || 
+      (keywords.length < 20 && /^[A-Z]/.test(keywords)) ||
+      !keywords.toLowerCase().match(/^(gaming|sports|music|irl|podcast|comedy|news|fortnite|valorant|minecraft|league|cod|gta|apex)/);
+    
+    // Strategy 1: If looks like a channel name, try channel search FIRST
+    if (looksLikeChannelName) {
+      console.log(`[${workerId}] Keywords "${keywords}" look like a channel name, searching channels first`);
       const channels = await searchTwitchChannels(keywords);
+      
       if (channels.length > 0) {
-        broadcasterId = channels[0].id;
-        console.log(`[${workerId}] Found channel: ${channels[0].display_name} (ID: ${broadcasterId})`);
+        const channel = channels[0];
+        console.log(`[${workerId}] Found channel: ${channel.display_name} (ID: ${channel.id})`);
+        searchAttempts.push({ type: 'channel', name: channel.display_name, id: channel.id });
+        
+        clips = await getTwitchTopClips({ broadcasterId: channel.id, limit: maxClips, recencyDays });
+        console.log(`[${workerId}] Channel "${channel.display_name}" returned ${clips.length} clips`);
+        
+        // If no clips from channel, try with longer recency
+        if (clips.length === 0 && recencyDays < 30) {
+          console.log(`[${workerId}] No clips in ${recencyDays} days, trying 30 days for channel`);
+          clips = await getTwitchTopClips({ broadcasterId: channel.id, limit: maxClips, recencyDays: 30 });
+          console.log(`[${workerId}] Channel with 30 days returned ${clips.length} clips`);
+        }
+      }
+    }
+    
+    // Strategy 2: If no clips yet, try game/category search
+    if (clips.length === 0) {
+      console.log(`[${workerId}] Trying game/category search for: ${keywords}`);
+      const games = await searchTwitchGames(keywords);
+      
+      if (games.length > 0) {
+        const game = games[0];
+        console.log(`[${workerId}] Found game: ${game.name} (ID: ${game.id})`);
+        searchAttempts.push({ type: 'game', name: game.name, id: game.id });
+        
+        clips = await getTwitchTopClips({ gameId: game.id, limit: maxClips, recencyDays });
+        console.log(`[${workerId}] Game "${game.name}" returned ${clips.length} clips`);
+      }
+    }
+    
+    // Strategy 3: If still no clips and we haven't tried channels yet, try now
+    if (clips.length === 0 && !searchAttempts.some(a => a.type === 'channel')) {
+      console.log(`[${workerId}] Trying channel search as fallback`);
+      const channels = await searchTwitchChannels(keywords);
+      
+      if (channels.length > 0) {
+        const channel = channels[0];
+        console.log(`[${workerId}] Found channel: ${channel.display_name} (ID: ${channel.id})`);
+        searchAttempts.push({ type: 'channel', name: channel.display_name, id: channel.id });
+        
+        clips = await getTwitchTopClips({ broadcasterId: channel.id, limit: maxClips, recencyDays: 30 });
+        console.log(`[${workerId}] Channel "${channel.display_name}" returned ${clips.length} clips`);
       }
     }
   }
   
-  // If we still don't have a gameId or broadcasterId, use a popular game as fallback
-  if (!gameId && !broadcasterId) {
-    console.log(`[${workerId}] No specific match found, using "Just Chatting" as default`);
+  // Strategy 4: Final fallback to "Just Chatting" if nothing found
+  if (clips.length === 0) {
+    console.log(`[${workerId}] No clips found from searches, falling back to "Just Chatting"`);
     const defaultGames = await searchTwitchGames('Just Chatting');
+    
     if (defaultGames.length > 0) {
-      gameId = defaultGames[0].id;
-    } else {
-      throw new Error('Unable to find any Twitch category to search clips for');
+      const game = defaultGames[0];
+      searchAttempts.push({ type: 'fallback', name: 'Just Chatting', id: game.id });
+      clips = await getTwitchTopClips({ gameId: game.id, limit: maxClips, recencyDays });
+      console.log(`[${workerId}] Fallback "Just Chatting" returned ${clips.length} clips`);
     }
   }
   
-  // Get top clips for the game or broadcaster with recency filter
-  const clips = await getTwitchTopClips({ gameId, broadcasterId, limit: maxClips, recencyDays });
+  // Log what we tried for debugging
+  if (searchAttempts.length > 0) {
+    console.log(`[${workerId}] Search attempts: ${searchAttempts.map(a => `${a.type}:${a.name}`).join(', ')}`);
+  }
   
-  console.log(`[${workerId}] Found ${clips.length} Twitch clips`);
+  console.log(`[${workerId}] Final result: ${clips.length} Twitch clips`);
   
   return clips.map(clip => ({
     url: clip.url,
@@ -391,6 +436,7 @@ async function processDiscoverJob(job) {
   
   try {
     const platform = job.source_platform || 'twitch';
+    const category = job.category || null;
     
     // Parse discover config from keywords (JSON format from API)
     let keywords = '';
@@ -403,11 +449,27 @@ async function processDiscoverJob(job) {
         keywords = config.keywords || '';
         recencyDays = config.recencyDays || 7;
         maxResults = config.maxResults || 25;
-        console.log(`[${workerId}] Discover config: recencyDays=${recencyDays}, maxResults=${maxResults}, keywords="${keywords}"`);
+        console.log(`[${workerId}] Discover config: recencyDays=${recencyDays}, maxResults=${maxResults}, keywords="${keywords}", category="${category}"`);
       } catch (e) {
         // Fallback: treat as plain keywords string
         keywords = job.keywords;
       }
+    }
+    
+    // Use category as search term if no keywords provided
+    if (!keywords && category) {
+      // Map categories to better search terms for platform APIs
+      const categorySearchTerms = {
+        gaming: 'gaming',
+        podcast: 'podcast talk show',
+        irl: 'IRL Just Chatting',
+        sports: 'sports',
+        news: 'news politics',
+        comedy: 'comedy funny',
+        debate: 'debate discussion'
+      };
+      keywords = categorySearchTerms[category] || category;
+      console.log(`[${workerId}] Using category as search: "${keywords}"`);
     }
     
     let clips = [];
@@ -417,15 +479,12 @@ async function processDiscoverJob(job) {
       console.log(`[${workerId}] Using real Twitch API for discovery`);
       const twitchClips = await discoverTwitchClips(keywords, maxResults, recencyDays);
       
-      // Filter by recency and calculate velocity-based trend score
+      // Calculate velocity-based trend score
+      // Note: Recency filtering is done by the Twitch API (started_at param) and discoverTwitchClips
+      // We don't filter again here to preserve clips found with extended recency window
       const now = Date.now();
-      const recencyCutoff = now - (recencyDays * 24 * 60 * 60 * 1000);
       
       clips = twitchClips
-        .filter(clip => {
-          const clipDate = new Date(clip.created_at).getTime();
-          return clipDate >= recencyCutoff;
-        })
         .map(clip => {
           // Calculate hours since creation for velocity scoring
           const hoursSinceCreated = Math.max(1, (now - new Date(clip.created_at).getTime()) / (1000 * 60 * 60));
@@ -489,7 +548,11 @@ async function processDiscoverJob(job) {
     
     // Check if we have enough results
     if (clips.length === 0) {
-      throw new Error(`No trending results in last ${recencyDays} days. Try 30 days or a broader category.`);
+      const searchTerm = keywords || category || 'general content';
+      const suggestion = keywords 
+        ? `The creator "${keywords}" may not have clips in this period, or try a different spelling.`
+        : 'Try a different category or add specific keywords.';
+      throw new Error(`No clips found for "${searchTerm}" in the last ${recencyDays} days. ${suggestion}`);
     }
     
     if (clips.length < 5) {
