@@ -1804,6 +1804,326 @@ async function claimDiscoverJob() {
 }
 
 // ============================================
+// LONG-FORM CLIPPER WORKER LOGIC
+// ============================================
+
+async function claimLongFormJob() {
+  const { data: jobs, error: fetchError } = await supabase
+    .from('video_processing_jobs')
+    .select('*')
+    .eq('status', 'ready')
+    .eq('job_type', 'long_form')
+    .order('created_at', { ascending: true })
+    .limit(1);
+
+  if (fetchError || !jobs || jobs.length === 0) {
+    return null;
+  }
+
+  const job = jobs[0];
+
+  const { data: claimed, error: claimError } = await supabase
+    .from('video_processing_jobs')
+    .update({ status: 'processing' })
+    .eq('id', job.id)
+    .eq('status', 'ready')
+    .select()
+    .single();
+
+  if (claimError || !claimed) {
+    return null;
+  }
+
+  return claimed;
+}
+
+// Helper to escape shell arguments safely
+function escapeShellArg(arg) {
+  // Replace single quotes with escaped version
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+// Validate URL to prevent command injection and SSRF
+function isValidVideoUrl(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    
+    // Must be https
+    if (parsed.protocol !== 'https:') return false;
+    
+    // Only allow exact known video platform hostnames
+    const allowedHosts = [
+      'youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com',
+      'rumble.com', 'www.rumble.com',
+      'twitch.tv', 'www.twitch.tv', 'clips.twitch.tv'
+    ];
+    
+    // Exact match only - no subdomain tricks
+    if (!allowedHosts.includes(parsed.hostname)) return false;
+    
+    // Ensure path doesn't contain shell metacharacters
+    if (/[`$;|&<>(){}[\]\\]/.test(parsed.pathname + parsed.search)) return false;
+    
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function processLongFormJob(job) {
+  currentJobId = job.id;
+  console.log(`[${workerId}] Processing long_form job ${job.id}`);
+  console.log(`[${workerId}] Source URL: ${job.source_url}`);
+  
+  const tempDir = os.tmpdir();
+  const jobDir = path.join(tempDir, `longform_${job.id}`);
+  
+  try {
+    // Validate URL to prevent command injection
+    if (!isValidVideoUrl(job.source_url)) {
+      throw new Error('Invalid or unsupported video URL');
+    }
+    
+    // Create temp directory for this job
+    if (!fs.existsSync(jobDir)) {
+      fs.mkdirSync(jobDir, { recursive: true });
+    }
+    
+    // Parse job config
+    let config = {};
+    if (job.keywords) {
+      try {
+        config = JSON.parse(job.keywords);
+      } catch (e) {
+        console.log(`[${workerId}] No JSON config in keywords, using defaults`);
+      }
+    }
+    
+    const clipsRequested = job.clips_requested || config.clipsRequested || 5;
+    const avgClipSeconds = job.avg_clip_seconds || config.avgClipSeconds || 60;
+    
+    console.log(`[${workerId}] Config: ${clipsRequested} clips, ${avgClipSeconds}s each`);
+    
+    // Step 1: Download the video using yt-dlp
+    console.log(`[${workerId}] Downloading video from ${job.source_url}...`);
+    const downloadedVideo = path.join(jobDir, 'source.mp4');
+    
+    try {
+      // Download with yt-dlp - limit to 720p for faster processing
+      // Use shell escaping to prevent command injection
+      const safeUrl = escapeShellArg(job.source_url);
+      const safeOutput = escapeShellArg(downloadedVideo);
+      await execAsync(
+        `yt-dlp -f "bestvideo[height<=720]+bestaudio/best[height<=720]" --merge-output-format mp4 -o ${safeOutput} ${safeUrl}`,
+        { timeout: 600000 } // 10 minute timeout for download
+      );
+    } catch (dlError) {
+      console.error(`[${workerId}] yt-dlp error:`, dlError.message);
+      throw new Error(`Failed to download video: ${dlError.message}`);
+    }
+    
+    if (!fs.existsSync(downloadedVideo)) {
+      throw new Error('Video download failed - file not found');
+    }
+    
+    const downloadSize = fs.statSync(downloadedVideo).size;
+    console.log(`[${workerId}] Downloaded video: ${(downloadSize / 1024 / 1024).toFixed(2)} MB`);
+    
+    // Step 2: Get video duration using ffprobe
+    let videoDuration = 0;
+    try {
+      const { stdout } = await execAsync(
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${downloadedVideo}"`
+      );
+      videoDuration = parseFloat(stdout.trim());
+      console.log(`[${workerId}] Video duration: ${videoDuration.toFixed(2)}s`);
+    } catch (e) {
+      console.warn(`[${workerId}] Could not get duration, using estimate`);
+      videoDuration = (job.video_minutes || 60) * 60;
+    }
+    
+    // Step 3: Calculate clip timestamps
+    // For MVP, we'll extract clips at evenly-spaced intervals
+    // In production, this would use AI/transcription to find interesting moments
+    const clips = [];
+    const actualClipCount = Math.min(clipsRequested, Math.floor(videoDuration / avgClipSeconds));
+    
+    if (actualClipCount < 1) {
+      throw new Error('Video too short to extract clips');
+    }
+    
+    // Distribute clips evenly across the video, avoiding first/last 10%
+    const usableStart = videoDuration * 0.1;
+    const usableEnd = videoDuration * 0.9;
+    const usableLength = usableEnd - usableStart;
+    const interval = usableLength / actualClipCount;
+    
+    for (let i = 0; i < actualClipCount; i++) {
+      const startTime = usableStart + (interval * i);
+      clips.push({
+        index: i + 1,
+        start: startTime,
+        duration: Math.min(avgClipSeconds, videoDuration - startTime)
+      });
+    }
+    
+    console.log(`[${workerId}] Will extract ${clips.length} clips`);
+    
+    // Step 4: Extract and process each clip
+    const uploadedClips = [];
+    
+    for (const clip of clips) {
+      const clipFilename = `clip_${clip.index}.mp4`;
+      const clipPath = path.join(jobDir, clipFilename);
+      const verticalPath = path.join(jobDir, `vertical_${clip.index}.mp4`);
+      
+      console.log(`[${workerId}] Extracting clip ${clip.index}: start=${clip.start.toFixed(1)}s, duration=${clip.duration.toFixed(1)}s`);
+      
+      // Extract the clip segment
+      try {
+        await execAsync(
+          `ffmpeg -y -ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c copy "${clipPath}"`,
+          { timeout: 120000 }
+        );
+      } catch (e) {
+        console.warn(`[${workerId}] Clip extraction with copy failed, trying re-encode...`);
+        await execAsync(
+          `ffmpeg -y -ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c:v libx264 -c:a aac "${clipPath}"`,
+          { timeout: 300000 }
+        );
+      }
+      
+      // Convert to vertical (9:16) format
+      // Scale to fit 1080x1920 with blur background
+      console.log(`[${workerId}] Converting clip ${clip.index} to vertical format...`);
+      
+      const verticalFilter = [
+        // Create blurred background scaled to 1080x1920
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg]`,
+        // Scale original video to fit within 1080x1920
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0[fg]`,
+        // Overlay foreground on blurred background
+        `[bg][fg]overlay=0:0`
+      ].join(';');
+      
+      await execAsync(
+        `ffmpeg -y -i "${clipPath}" -filter_complex "${verticalFilter}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${verticalPath}"`,
+        { timeout: 300000 }
+      );
+      
+      if (!fs.existsSync(verticalPath)) {
+        console.warn(`[${workerId}] Failed to create vertical clip ${clip.index}`);
+        continue;
+      }
+      
+      // Upload to Supabase Storage
+      const storagePath = `${job.user_id}/${job.id}_clip${clip.index}.mp4`;
+      const fileBuffer = fs.readFileSync(verticalPath);
+      
+      console.log(`[${workerId}] Uploading clip ${clip.index} to storage...`);
+      
+      const { error: uploadError } = await supabase.storage
+        .from('renders')
+        .upload(storagePath, fileBuffer, {
+          contentType: 'video/mp4',
+          upsert: true
+        });
+      
+      if (uploadError) {
+        console.error(`[${workerId}] Upload error for clip ${clip.index}:`, uploadError.message);
+        continue;
+      }
+      
+      // Get public URL
+      const { data: urlData } = supabase.storage
+        .from('renders')
+        .getPublicUrl(storagePath);
+      
+      uploadedClips.push({
+        index: clip.index,
+        url: urlData.publicUrl,
+        start: clip.start,
+        duration: clip.duration
+      });
+      
+      console.log(`[${workerId}] Clip ${clip.index} uploaded: ${urlData.publicUrl}`);
+      
+      // Cleanup temp clip files
+      try {
+        fs.unlinkSync(clipPath);
+        fs.unlinkSync(verticalPath);
+      } catch (e) {
+        // Ignore cleanup errors
+      }
+    }
+    
+    if (uploadedClips.length === 0) {
+      throw new Error('Failed to extract any clips from video');
+    }
+    
+    // Step 5: Update job with results
+    const resultUrl = uploadedClips[0].url; // Primary result is first clip
+    const resultData = {
+      clips: uploadedClips,
+      totalClips: uploadedClips.length,
+      sourceUrl: job.source_url,
+      videoDuration: videoDuration
+    };
+    
+    // Update keywords to include result clips
+    let updatedKeywords = config;
+    updatedKeywords.resultClips = uploadedClips.map(c => c.url);
+    
+    const { error: updateError } = await supabase
+      .from('video_processing_jobs')
+      .update({
+        status: 'done',
+        render_status: 'done',
+        result_url: resultUrl,
+        keywords: JSON.stringify(updatedKeywords)
+      })
+      .eq('id', job.id);
+    
+    if (updateError) {
+      throw new Error(`Failed to update job: ${updateError.message}`);
+    }
+    
+    console.log(`[${workerId}] Long-form job ${job.id} completed with ${uploadedClips.length} clips`);
+    
+    // Cleanup
+    try {
+      fs.unlinkSync(downloadedVideo);
+      fs.rmdirSync(jobDir, { recursive: true });
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+    
+    currentJobId = null;
+    
+  } catch (err) {
+    console.error(`[${workerId}] Error processing long_form job ${job.id}:`, err.message);
+    
+    await supabase
+      .from('video_processing_jobs')
+      .update({ 
+        status: 'failed', 
+        error: err.message
+      })
+      .eq('id', job.id);
+    
+    // Cleanup on error
+    try {
+      fs.rmdirSync(jobDir, { recursive: true });
+    } catch (e) {
+      // Ignore
+    }
+    
+    currentJobId = null;
+  }
+}
+
+// ============================================
 // MAIN POLLING LOOP
 // ============================================
 
@@ -1842,6 +2162,15 @@ async function pollForWork() {
     if (discoverJob) {
       console.log(`[${workerId}] Found discover job: ${discoverJob.id}`);
       await processDiscoverJob(discoverJob);
+      return;
+    }
+    
+    // Then check for long-form clipper jobs
+    console.log(`[${workerId}] Checking for long-form jobs...`);
+    const longFormJob = await claimLongFormJob();
+    if (longFormJob) {
+      console.log(`[${workerId}] Found long-form job: ${longFormJob.id}`);
+      await processLongFormJob(longFormJob);
       return;
     }
     
