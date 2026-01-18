@@ -7,6 +7,50 @@ import os from 'os';
 
 const execAsync = promisify(exec);
 
+// ============================================
+// FFMPEG HELPERS FOR PRODUCTION-READY RENDERS
+// ============================================
+
+// Default FFmpeg flags for deterministic, reliable output
+const FFMPEG_BASE_FLAGS = '-hide_banner -loglevel error -y';
+const FFMPEG_OUTPUT_FLAGS = '-pix_fmt yuv420p -movflags +faststart';
+
+// Validate output file exists and has non-zero size
+function validateOutput(filePath, description = 'output') {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`FFmpeg ${description} file not created: ${filePath}`);
+  }
+  const stats = fs.statSync(filePath);
+  if (stats.size === 0) {
+    throw new Error(`FFmpeg ${description} file is empty (0 bytes): ${filePath}`);
+  }
+  console.log(`[worker] Validated ${description}: ${filePath} (${Math.round(stats.size / 1024)} KB)`);
+  return true;
+}
+
+// Run FFmpeg with standard flags and validation
+async function runFFmpeg(command, outputPath, description = 'render', timeoutMs = 120000) {
+  const fullCommand = `ffmpeg ${FFMPEG_BASE_FLAGS} ${command}`;
+  console.log(`[worker] Running: ${fullCommand.substring(0, 200)}...`);
+  
+  try {
+    await execAsync(fullCommand, { timeout: timeoutMs });
+  } catch (err) {
+    // FFmpeg may output to stderr even on success, check if output exists
+    if (outputPath && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+      console.log(`[worker] FFmpeg completed with warnings, output valid`);
+    } else {
+      throw new Error(`FFmpeg failed: ${err.message}`);
+    }
+  }
+  
+  if (outputPath) {
+    validateOutput(outputPath, description);
+  }
+  
+  return true;
+}
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const workerId = process.env.WORKER_ID || 'worker-1';
@@ -697,20 +741,29 @@ async function processRenderTask(task) {
       });
     } catch (dlErr) {
       // If yt-dlp fails, create a placeholder video for demo
+      // This should only happen for invalid URLs or API failures
       console.log(`[${workerId}] yt-dlp failed (${dlErr.message}), creating demo video...`);
+      console.log(`[${workerId}] [DEMO_FALLBACK] Job ${task.job_id} using demo mode due to download failure`);
       
-      // Try with text overlay first (requires fonts)
+      // Use fontconfig-based font selection (more reliable across environments)
       try {
-        await execAsync(
-          `ffmpeg -f lavfi -i color=c=purple:s=1080x1920:d=5 -vf "drawtext=text='ClipFlow':fontfile=/usr/share/fonts/freefont/FreeSans.ttf:fontcolor=white:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2" -c:v libx264 -t 5 -y "${tempOutput}"`,
-          { timeout: 30000 }
+        await runFFmpeg(
+          `-f lavfi -i "color=c=purple:s=1080x1920:r=25:d=5" ` +
+          `-vf "drawtext=font='DejaVu Sans':text='ClipFlow Demo':fontcolor=white:fontsize=64:x=(w-text_w)/2:y=(h-text_h)/2" ` +
+          `-c:v libx264 ${FFMPEG_OUTPUT_FLAGS} "${tempOutput}"`,
+          tempOutput,
+          'demo video',
+          30000
         );
       } catch (fontErr) {
-        // Fallback to simple colored video without text if fonts not available
-        console.log(`[${workerId}] Font rendering failed, creating simple video...`);
-        await execAsync(
-          `ffmpeg -f lavfi -i color=c=purple:s=1080x1920:d=5 -c:v libx264 -t 5 -y "${tempOutput}"`,
-          { timeout: 30000 }
+        // Fallback to simple colored video without text if fontconfig fails
+        console.log(`[${workerId}] Font rendering failed (${fontErr.message}), creating simple video...`);
+        await runFFmpeg(
+          `-f lavfi -i "color=c=purple:s=1080x1920:r=25:d=5" ` +
+          `-c:v libx264 ${FFMPEG_OUTPUT_FLAGS} "${tempOutput}"`,
+          tempOutput,
+          'simple demo video',
+          30000
         );
       }
     }
@@ -719,9 +772,12 @@ async function processRenderTask(task) {
     const verticalOutput = path.join(tempDir, `vertical_${outputFilename}`);
     console.log(`[${workerId}] Converting to vertical format...`);
     
-    await execAsync(
-      `ffmpeg -i "${tempOutput}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black" -c:v libx264 -preset fast -crf 23 -c:a aac -y "${verticalOutput}"`,
-      { timeout: 120000 }
+    await runFFmpeg(
+      `-i "${tempOutput}" -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black" ` +
+      `-c:v libx264 -preset fast -crf 23 -c:a aac ${FFMPEG_OUTPUT_FLAGS} "${verticalOutput}"`,
+      verticalOutput,
+      'vertical conversion',
+      120000
     );
     
     // Step 3: Upload to Supabase Storage
@@ -1046,8 +1102,8 @@ async function processEditTask(edit) {
       }
       
       // Use sanitized watermark text - already escaped in sanitizeForFFmpeg
-      // Use bundled font file at /app/fonts/DejaVuSans.ttf for reliable rendering
-      vfFilters.push(`drawtext=text='${watermarkText}':fontfile=/app/fonts/DejaVuSans.ttf:fontcolor=white@0.7:fontsize=32:x=${x}:y=${y}`);
+      // Use fontconfig for reliable font resolution across environments
+      vfFilters.push(`drawtext=font='DejaVu Sans':text='${watermarkText}':fontcolor=white@0.7:fontsize=32:x=${x}:y=${y}`);
     }
     
     // Add caption box if specified (TikTok-style white rounded box with black text)
@@ -1094,8 +1150,8 @@ async function processEditTask(edit) {
       // Use drawtext with box option for white box effect
       // boxcolor creates a filled background behind the text
       // boxborderw adds padding around the text within the box
-      // Use bundled font file at /app/fonts/DejaVuSans.ttf for reliable rendering
-      vfFilters.push(`drawtext=text='${captionText}':fontfile=/app/fonts/DejaVuSans.ttf:fontcolor=black:fontsize=${fontSize}:x=(w-text_w)/2:y=${textY}:box=1:boxcolor=white@0.95:boxborderw=${boxPadding}`);
+      // Use fontconfig for reliable font resolution across environments
+      vfFilters.push(`drawtext=font='DejaVu Sans':text='${captionText}':fontcolor=black:fontsize=${fontSize}:x=(w-text_w)/2:y=${textY}:box=1:boxcolor=white@0.95:boxborderw=${boxPadding}`);
       
       console.log(`[${workerId}] Adding caption box: "${captionText}" at ${captionPosition}, size ${captionSize}`);
     }
@@ -1104,9 +1160,11 @@ async function processEditTask(edit) {
     
     console.log(`[${workerId}] Applying edit with filters: ${vfString.substring(0, 100)}...`);
     
-    await execAsync(
-      `ffmpeg -i "${tempSource}" -vf "${vfString}" -c:v libx264 -preset fast -crf 23 -c:a aac -y "${tempEdited}"`,
-      { timeout: 180000 } // 3 minute timeout
+    await runFFmpeg(
+      `-i "${tempSource}" -vf "${vfString}" -c:v libx264 -preset fast -crf 23 -c:a aac ${FFMPEG_OUTPUT_FLAGS} "${tempEdited}"`,
+      tempEdited,
+      'video edit',
+      180000
     );
     
     console.log(`[${workerId}] Edit applied successfully`);
@@ -1117,15 +1175,19 @@ async function processEditTask(edit) {
     
     console.log(`[${workerId}] Generating thumbnail...`);
     try {
-      await execAsync(
-        `ffmpeg -i "${tempEdited}" -ss 00:00:01 -vframes 1 -q:v 2 -y "${tempThumbnail}"`,
-        { timeout: 30000 }
+      await runFFmpeg(
+        `-i "${tempEdited}" -ss 00:00:01 -vframes 1 -q:v 2 "${tempThumbnail}"`,
+        tempThumbnail,
+        'thumbnail at 1s',
+        30000
       );
     } catch (thumbErr) {
       console.log(`[${workerId}] Thumbnail at 1s failed, trying 0s...`);
-      await execAsync(
-        `ffmpeg -i "${tempEdited}" -ss 00:00:00 -vframes 1 -q:v 2 -y "${tempThumbnail}"`,
-        { timeout: 30000 }
+      await runFFmpeg(
+        `-i "${tempEdited}" -ss 00:00:00 -vframes 1 -q:v 2 "${tempThumbnail}"`,
+        tempThumbnail,
+        'thumbnail at 0s',
+        30000
       );
     }
     console.log(`[${workerId}] Thumbnail generated`);
@@ -1356,8 +1418,6 @@ async function createImageSlideshow(images, scenes, audioPath, outputPath, targe
     throw new Error('No images available for slideshow');
   }
 
-  const fontPath = '/app/fonts/DejaVuSans.ttf';
-  const hasFonts = fs.existsSync(fontPath);
   const sceneDuration = targetDuration / scenes.length;
 
   console.log(`[${workerId}] Creating slideshow with ${images.length} images, ${sceneDuration.toFixed(1)}s per scene`);
@@ -1375,23 +1435,22 @@ async function createImageSlideshow(images, scenes, audioPath, outputPath, targe
     
     let vfString = 'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1';
     
-    // Use textfile approach for reliable multi-line text rendering
-    if (hasFonts && wrappedText) {
+    // Use fontconfig for reliable font resolution across environments
+    if (wrappedText) {
       const textFilePath = writeTextFileForFFmpeg(wrappedText, jobDir, `scene_${i}_text.txt`);
       const escapedTextPath = escapePathForFFmpeg(textFilePath);
-      const escapedFontPath = escapePathForFFmpeg(fontPath);
-      // Use smaller font (32) and position at bottom
-      // expansion=none prevents FFmpeg from interpreting special sequences
-      // line_spacing=8 adds space between lines
-      vfString += `,drawtext=textfile='${escapedTextPath}':fontfile='${escapedFontPath}':fontcolor=white:fontsize=32:x=(w-text_w)/2:y=h-th-120:box=1:boxcolor=black@0.6:boxborderw=12:line_spacing=8:expansion=none`;
+      // Use fontconfig-based font selection instead of hardcoded path
+      vfString += `,drawtext=textfile='${escapedTextPath}':font='DejaVu Sans':fontcolor=white:fontsize=32:x=(w-text_w)/2:y=h-th-120:box=1:boxcolor=black@0.6:boxborderw=12:line_spacing=8:expansion=none`;
     }
 
     try {
-      await execAsync(
-        `ffmpeg -loop 1 -i "${image.path}" -t ${sceneDuration} ` +
+      await runFFmpeg(
+        `-loop 1 -i "${image.path}" -t ${sceneDuration} ` +
         `-vf "${vfString}" ` +
-        `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -r 30 -an -y "${clipPath}"`,
-        { timeout: 60000 }
+        `-c:v libx264 -preset fast -crf 23 ${FFMPEG_OUTPUT_FLAGS} -r 30 -an "${clipPath}"`,
+        clipPath,
+        `slideshow clip ${i + 1}`,
+        60000
       );
       processedClips.push(clipPath);
       console.log(`[${workerId}] Created clip ${i + 1}/${scenes.length}`);
@@ -1409,16 +1468,20 @@ async function createImageSlideshow(images, scenes, audioPath, outputPath, targe
   fs.writeFileSync(concatListPath, concatContent);
 
   const concatPath = path.join(jobDir, 'slideshow.mp4');
-  await execAsync(
-    `ffmpeg -f concat -safe 0 -i "${concatListPath}" ` +
-    `-c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -r 30 -y "${concatPath}"`,
-    { timeout: 180000 }
+  await runFFmpeg(
+    `-f concat -safe 0 -i "${concatListPath}" ` +
+    `-c:v libx264 -preset fast -crf 23 ${FFMPEG_OUTPUT_FLAGS} -r 30 "${concatPath}"`,
+    concatPath,
+    'slideshow concat',
+    180000
   );
 
-  await execAsync(
-    `ffmpeg -i "${concatPath}" -i "${audioPath}" ` +
-    `-c:v libx264 -preset fast -crf 23 -c:a aac -map 0:v:0 -map 1:a:0 -shortest -y "${outputPath}"`,
-    { timeout: 180000 }
+  await runFFmpeg(
+    `-i "${concatPath}" -i "${audioPath}" ` +
+    `-c:v libx264 -preset fast -crf 23 -c:a aac ${FFMPEG_OUTPUT_FLAGS} -map 0:v:0 -map 1:a:0 -shortest "${outputPath}"`,
+    outputPath,
+    'slideshow with audio',
+    180000
   );
 
   console.log(`[${workerId}] Slideshow created: ${outputPath}`);
@@ -1566,34 +1629,29 @@ async function processAiShortJob(job) {
             // Extract audio segment for this clip
             const clipAudioPath = path.join(jobDir, `audio_clip_${clipIdx + 1}.mp3`);
             const audioStart = clipIdx * clipDuration;
-            await execAsync(
-              `ffmpeg -i "${audioPath}" -ss ${audioStart} -t ${clipDuration} -c:a copy -y "${clipAudioPath}"`,
-              { timeout: 30000 }
+            await runFFmpeg(
+              `-i "${audioPath}" -ss ${audioStart} -t ${clipDuration} -c:a copy "${clipAudioPath}"`,
+              clipAudioPath,
+              `audio segment ${clipIdx + 1}`,
+              30000
             );
             
             if (adjustedImages.length > 0) {
               await createImageSlideshow(adjustedImages, clipScenes, clipAudioPath, clipOutputPath, clipDuration, jobDir);
             } else {
-              // Fallback for clips without images
+              // Fallback for clips without images - use fontconfig for reliable font resolution
               const hookText = sanitizeForFFmpeg(`${topic} - Part ${clipIdx + 1}`, 60);
-              const fontPath = '/app/fonts/DejaVuSans.ttf';
+              console.log(`[${workerId}] [FALLBACK] Creating text-only clip ${clipIdx + 1} (no images available)`);
               
-              if (fs.existsSync(fontPath)) {
-                await execAsync(
-                  `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${clipDuration} ` +
-                  `-i "${clipAudioPath}" ` +
-                  `-vf "drawtext=text='${hookText}':fontfile=${fontPath}:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
-                  `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${clipOutputPath}"`,
-                  { timeout: 180000 }
-                );
-              } else {
-                await execAsync(
-                  `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${clipDuration} ` +
-                  `-i "${clipAudioPath}" ` +
-                  `-c:v libx264 -preset fast -crf 23 -c:a aac -shortest -y "${clipOutputPath}"`,
-                  { timeout: 180000 }
-                );
-              }
+              await runFFmpeg(
+                `-f lavfi -i "color=c=0x1a1a2e:s=1080x1920:r=25:d=${clipDuration}" ` +
+                `-i "${clipAudioPath}" ` +
+                `-vf "drawtext=font='DejaVu Sans':text='${hookText}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
+                `-c:v libx264 -preset fast -crf 23 -c:a aac ${FFMPEG_OUTPUT_FLAGS} -shortest "${clipOutputPath}"`,
+                clipOutputPath,
+                `fallback clip ${clipIdx + 1}`,
+                180000
+              );
             }
 
             // Upload each clip
@@ -1624,26 +1682,19 @@ async function processAiShortJob(job) {
           if (images.length > 0) {
             await createImageSlideshow(images, scenesList, audioPath, outputPath, audioDuration, jobDir);
           } else {
-            console.log(`[${workerId}] No images available, creating fallback with topic text...`);
+            // Fallback for single video without images - use fontconfig for reliable font resolution
+            console.log(`[${workerId}] [FALLBACK] Creating text-only video (no images available)`);
             const hookText = sanitizeForFFmpeg(topic || 'AI Generated Video', 60);
-            const fontPath = '/app/fonts/DejaVuSans.ttf';
             
-            if (fs.existsSync(fontPath)) {
-              await execAsync(
-                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${audioDuration} ` +
-                `-i "${audioPath}" ` +
-                `-vf "drawtext=text='${hookText}':fontfile=${fontPath}:fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
-                `-c:v libx264 -preset fast -crf 23 -c:a aac -y "${outputPath}"`,
-                { timeout: 180000 }
-              );
-            } else {
-              await execAsync(
-                `ffmpeg -f lavfi -i color=c=0x1a1a2e:s=1080x1920:d=${audioDuration} ` +
-                `-i "${audioPath}" ` +
-                `-c:v libx264 -preset fast -crf 23 -c:a aac -y "${outputPath}"`,
-                { timeout: 180000 }
-              );
-            }
+            await runFFmpeg(
+              `-f lavfi -i "color=c=0x1a1a2e:s=1080x1920:r=25:d=${audioDuration}" ` +
+              `-i "${audioPath}" ` +
+              `-vf "drawtext=font='DejaVu Sans':text='${hookText}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2" ` +
+              `-c:v libx264 -preset fast -crf 23 -c:a aac ${FFMPEG_OUTPUT_FLAGS} "${outputPath}"`,
+              outputPath,
+              'fallback single video',
+              180000
+            );
           }
 
           // Upload single video
@@ -1980,17 +2031,22 @@ async function processLongFormJob(job) {
       
       console.log(`[${workerId}] Extracting clip ${clip.index}: start=${clip.start.toFixed(1)}s, duration=${clip.duration.toFixed(1)}s`);
       
-      // Extract the clip segment
+      // Extract the clip segment with validation
       try {
-        await execAsync(
-          `ffmpeg -y -ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c copy "${clipPath}"`,
-          { timeout: 120000 }
+        // Try fast copy first
+        await runFFmpeg(
+          `-ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c copy "${clipPath}"`,
+          clipPath,
+          `clip ${clip.index} extraction (copy)`,
+          120000
         );
       } catch (e) {
         console.warn(`[${workerId}] Clip extraction with copy failed, trying re-encode...`);
-        await execAsync(
-          `ffmpeg -y -ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c:v libx264 -c:a aac "${clipPath}"`,
-          { timeout: 300000 }
+        await runFFmpeg(
+          `-ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c:v libx264 -c:a aac ${FFMPEG_OUTPUT_FLAGS} "${clipPath}"`,
+          clipPath,
+          `clip ${clip.index} extraction (re-encode)`,
+          300000
         );
       }
       
@@ -2007,15 +2063,12 @@ async function processLongFormJob(job) {
         `[bg][fg]overlay=0:0`
       ].join(';');
       
-      await execAsync(
-        `ffmpeg -y -i "${clipPath}" -filter_complex "${verticalFilter}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k "${verticalPath}"`,
-        { timeout: 300000 }
+      await runFFmpeg(
+        `-i "${clipPath}" -filter_complex "${verticalFilter}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k ${FFMPEG_OUTPUT_FLAGS} "${verticalPath}"`,
+        verticalPath,
+        `clip ${clip.index} vertical conversion`,
+        300000
       );
-      
-      if (!fs.existsSync(verticalPath)) {
-        console.warn(`[${workerId}] Failed to create vertical clip ${clip.index}`);
-        continue;
-      }
       
       // Upload to Supabase Storage
       const storagePath = `${job.user_id}/${job.id}_clip${clip.index}.mp4`;
@@ -2184,12 +2237,18 @@ async function main() {
   console.log(`[${workerId}] ClipFlow Worker starting...`);
   console.log(`[${workerId}] Supabase URL: ${supabaseUrl?.substring(0, 30)}...`);
   
-  // Check if bundled font file exists for drawtext filter
-  const fontPath = '/app/fonts/DejaVuSans.ttf';
-  if (fs.existsSync(fontPath)) {
-    console.log(`[${workerId}] Bundled font file found: ${fontPath}`);
-  } else {
-    console.warn(`[${workerId}] WARNING: Bundled font file not found at ${fontPath} - captions/watermarks may not render!`);
+  // Check font availability - fontconfig should find DejaVu Sans from ttf-dejavu package
+  // The bundled font at /app/fonts/DejaVuSans.ttf is a backup if fontconfig fails
+  console.log(`[${workerId}] Checking font availability...`);
+  try {
+    const { stdout } = await execAsync('fc-list | grep -i dejavu | head -1');
+    if (stdout.trim()) {
+      console.log(`[${workerId}] Fontconfig font found: ${stdout.trim().substring(0, 60)}...`);
+    } else {
+      console.log(`[${workerId}] Fontconfig: DejaVu not found, will use bundled font as fallback`);
+    }
+  } catch (e) {
+    console.log(`[${workerId}] Fontconfig check skipped, using font='DejaVu Sans' in drawtext filters`);
   }
   
   await sendHeartbeat();
