@@ -2057,8 +2057,8 @@ async function processLongFormJob(job) {
       const verticalFilter = [
         // Create blurred background scaled to 1080x1920
         `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg]`,
-        // Scale original video to fit within 1080x1920
-        `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black@0[fg]`,
+        // Scale original video to fit within 1080x1920 (use solid black padding - MP4 doesn't support transparency)
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black[fg]`,
         // Overlay foreground on blurred background
         `[bg][fg]overlay=0:0`
       ].join(';');
