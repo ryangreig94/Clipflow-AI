@@ -2031,44 +2031,57 @@ async function processLongFormJob(job) {
       
       console.log(`[${workerId}] Extracting clip ${clip.index}: start=${clip.start.toFixed(1)}s, duration=${clip.duration.toFixed(1)}s`);
       
-      // Extract the clip segment with validation
-      try {
-        // Try fast copy first
-        await runFFmpeg(
-          `-ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c copy "${clipPath}"`,
-          clipPath,
-          `clip ${clip.index} extraction (copy)`,
-          120000
-        );
-      } catch (e) {
-        console.warn(`[${workerId}] Clip extraction with copy failed, trying re-encode...`);
-        await runFFmpeg(
-          `-ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} -c:v libx264 -c:a aac ${FFMPEG_OUTPUT_FLAGS} "${clipPath}"`,
-          clipPath,
-          `clip ${clip.index} extraction (re-encode)`,
-          300000
-        );
-      }
+      // Extract clip with re-encode (avoids keyframe issues with -c copy on YouTube videos)
+      await runFFmpeg(
+        `-ss ${clip.start} -i "${downloadedVideo}" -t ${clip.duration} ` +
+        `-c:v libx264 -preset veryfast -crf 22 -c:a aac -b:a 128k ${FFMPEG_OUTPUT_FLAGS} "${clipPath}"`,
+        clipPath,
+        `clip ${clip.index} extraction`,
+        300000
+      );
       
-      // Convert to vertical (9:16) format
-      // Scale to fit 1080x1920 with blur background
+      // Convert to vertical (9:16) format with proven filter
+      // Uses blurred background + centered foreground, no transparency
       console.log(`[${workerId}] Converting clip ${clip.index} to vertical format...`);
       
       const verticalFilter = [
+        // Scale foreground video with lanczos filter for quality
+        `[0:v]fps=30,scale=1080:-2:flags=lanczos,setsar=1[vfg]`,
         // Create blurred background scaled to 1080x1920
-        `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg]`,
-        // Scale original video to fit within 1080x1920 (use solid black padding - MP4 doesn't support transparency)
-        `[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black[fg]`,
-        // Overlay foreground on blurred background
-        `[bg][fg]overlay=0:0`
+        `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:1[bg]`,
+        // Overlay foreground centered on background, force yuv420p output
+        `[bg][vfg]overlay=(W-w)/2:(H-h)/2:format=auto,format=yuv420p[v]`
       ].join(';');
       
       await runFFmpeg(
-        `-i "${clipPath}" -filter_complex "${verticalFilter}" -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 128k ${FFMPEG_OUTPUT_FLAGS} "${verticalPath}"`,
+        `-i "${clipPath}" -filter_complex "${verticalFilter}" -map "[v]" -map 0:a? ` +
+        `-c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 128k -movflags +faststart -shortest "${verticalPath}"`,
         verticalPath,
         `clip ${clip.index} vertical conversion`,
         300000
       );
+      
+      // Validate output before upload - check file size and video stream
+      const fileSize = fs.statSync(verticalPath).size;
+      if (fileSize < 200 * 1024) { // Less than 200KB is likely broken
+        throw new Error(`Clip ${clip.index} output too small (${fileSize} bytes) - conversion likely failed`);
+      }
+      
+      // Validate video stream exists with ffprobe
+      try {
+        const { stdout: probeOutput } = await execAsync(
+          `ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,duration -of json "${verticalPath}"`,
+          { timeout: 30000 }
+        );
+        const probeData = JSON.parse(probeOutput);
+        if (!probeData.streams || probeData.streams.length === 0) {
+          throw new Error(`Clip ${clip.index} has no video stream`);
+        }
+        const stream = probeData.streams[0];
+        console.log(`[${workerId}] Clip ${clip.index} validated: ${stream.codec_name} ${stream.width}x${stream.height}`);
+      } catch (probeError) {
+        throw new Error(`Clip ${clip.index} validation failed: ${probeError.message}`);
+      }
       
       // Upload to Supabase Storage
       const storagePath = `${job.user_id}/${job.id}_clip${clip.index}.mp4`;
