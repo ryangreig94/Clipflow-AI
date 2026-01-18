@@ -1,23 +1,24 @@
 FROM node:20-alpine
 
-# Install ffmpeg, yt-dlp, and fonts with fontconfig for reliable text rendering
+# Install ffmpeg + python/pip + fonts + ca certs
 RUN apk add --no-cache \
     ffmpeg \
     python3 \
     py3-pip \
+    ca-certificates \
     fontconfig \
     ttf-dejavu \
-    && pip3 install --break-system-packages yt-dlp \
-    && fc-cache -f
+  && pip3 install --no-cache-dir -U yt-dlp \
+  && fc-cache -f \
+  && yt-dlp --version \
+  && ffmpeg -version
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --production
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev || npm install --production
 
 COPY src ./src
-
-# Copy bundled fonts as backup (OS fonts preferred via fontconfig)
 COPY fonts ./fonts
 
 CMD ["npm", "run", "start"]
